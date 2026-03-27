@@ -1,0 +1,152 @@
+clear; clc; close all;
+% ==========================================================
+% 45km 场景：与 main_1000 逻辑一致，参数按尺度缩放以控制运行时间
+% 核心：Nslot=50、N=64 与 main_1000 相同，单次迭代约数分钟
+% ==========================================================
+
+% 1. 轨迹起终点（位于基站下方，与 main_1000 几何结构类似）
+x_start = 5000;  y_start = -8000;
+x_end   = 40000; y_end   = -8000;
+
+% 2. 边界限制
+x_min = 0;       x_max = 45000;
+y_min = y_start; y_max = 0;      % y ∈ [y_start, 0]，向用户方向探索
+
+% 3. 运动学参数（与 main_1000 比例一致：Nslot=50，单时隙位移 ~2% 场景尺度）
+v_max = 25;      % 最大速度 (m/s)
+Nslot   = 80;    % 与 main_1000 相同，保证迭代可接受
+T_total = 2500;  % 总时间：dt=40s，v_max*dt=1000m，足以覆盖 35km+8km 路径
+dt      = T_total / Nslot;
+
+fprintf('=== 45km 场景 (与 main_1000 逻辑一致) ===\n');
+fprintf('起点: [%.0f, %.0f], 终点: [%.0f, %.0f]\n', x_start, y_start, x_end, y_end);
+fprintf('Nslot=%d, 单时隙位移: %.0f m\n', Nslot, N, v_max * dt);
+
+% 5. 用户位置（中心在 [45000, 0, 10]，半径 1500m）
+user_X_center = 45000;
+user_Y_center = 0;
+user_R        = 1500;
+
+% 6. 高度设置
+ht_BS   = 35;          % 基站高度 35m
+h_RIS   = 15;          % USV (RIS) 高度 15m
+hr_User = 10;          % 用户高度 10m
+
+% 7. 通信参数（N=64 与 main_1000 一致，cvx_solve_theta 约 16× 加速）
+K = 4; M = 10; N = 128;
+P_total_dBm = 47;
+P_total_mW  = 10^(P_total_dBm/10);
+RIS_power_ratio = 0.1; % 与 main_1000 一致
+Pr_max = P_total_mW * RIS_power_ratio;      
+Ps_max = P_total_mW * (1 - RIS_power_ratio); 
+fprintf('功率分配: 基站 %.2f W, RIS %.2f W\n', Ps_max/1000, Pr_max/1000);
+
+% 噪声与信道参数
+sigma2  = 1e-13; sigmar2 = 1e-13; eta_k = ones(K,1);   
+f_c = 5; lambda = 3e8/(f_c*1e9); K_rician = 10;         
+tau_power = 4; kappa_power = 4; gamma_reflect = 0;
+scale_G = 1e3; scale_f = 1e6;
+
+% 8. 初始轨迹生成（线性插值）
+x_traj = linspace(x_start, x_end, Nslot).';
+y_traj = linspace(y_start, y_end, Nslot).';
+
+bs_pos = [0, 0, ht_BS];
+
+% 用户生成
+rng(42);
+theta = 2*pi*rand(K,1); rad = user_R*rand(K,1);
+user_pos = zeros(K,3);
+for k = 1:K
+    user_pos(k,:) = [user_X_center + rad(k)*cos(theta(k)), user_Y_center + rad(k)*sin(theta(k)), hr_User];
+end
+
+% 信道初始化
+rng(123);
+h_k0 = zeros(M,K); f_k0 = zeros(N,K); G0 = zeros(N,M);
+Theta0 = diag(exp(1j*2*pi*rand(N,1)));
+W0 = exp(1j*2*pi*rand(K*M,1))*sqrt(Ps_max/K/M);
+
+% 结构体打包配置
+traj_cfg = struct();
+traj_cfg.enable = true;
+traj_cfg.bs_pos = bs_pos;
+traj_cfg.user_pos = user_pos;
+traj_cfg.x_traj = x_traj;
+traj_cfg.y_traj = y_traj;
+traj_cfg.h_const = h_RIS;
+traj_cfg.Nslot = Nslot;
+traj_cfg.dt = dt;
+traj_cfg.v_max = v_max;
+traj_cfg.x_min = x_min; traj_cfg.x_max = x_max;
+traj_cfg.y_min = y_min; traj_cfg.y_max = y_max; % 传入 y_max=0
+traj_cfg.lambda = lambda;
+traj_cfg.gamma_reflect = gamma_reflect;
+traj_cfg.K_rician = K_rician;
+traj_cfg.tau_power = tau_power;
+traj_cfg.kappa_power = kappa_power;
+traj_cfg.no_direct_link = false;
+traj_cfg.MaxIter = 15;  % 与 main_1000 一致
+traj_cfg.MinIter = 5;
+traj_cfg.allow_hover_at_max_wsr = false;
+traj_cfg.return_to_endpoint = true;
+traj_cfg.user_X_center = user_X_center; traj_cfg.user_R = user_R; 
+traj_cfg.user_Y_center = user_Y_center; 
+traj_cfg.scale_G = scale_G; traj_cfg.scale_f = scale_f;
+traj_cfg.use_smart_init = false;   % 大场景下关闭，避免 warm start 失效时 E1/E2/E3 不稳定
+traj_cfg.trust_step = 0.5 * v_max * dt;  % SCA 信赖域与单时隙位移匹配，避免过大步长
+
+% ==========================================================
+% 调用核心优化函数
+% ==========================================================
+[W_opt, Theta_opt, Rsum, ~, ~, x_opt, y_opt, rate_hist, ~] = active_RIS_precoding(M, K, N, Ps_max, Pr_max, sigma2, sigmar2, eta_k, Theta0, W0, h_k0, f_k0, G0, traj_cfg);
+
+% ==========================================================
+% 结果绘图
+% ==========================================================
+wsr_final = rate_hist(:, end);
+[wsr_max, best_slot] = max(wsr_final);
+best_x = x_opt(best_slot); best_y = y_opt(best_slot);
+high_wsr_idx = find(wsr_final >= 0.8 * wsr_max);
+
+figure('Position', [100, 100, 1200, 500]);
+
+% 子图1：轨迹图（与 main_1000 风格一致）
+subplot(1, 2, 1); hold on; grid on; box on;
+plot(bs_pos(1), bs_pos(2), 'ks', 'MarkerSize', 10, 'MarkerFaceColor', 'g', 'LineWidth', 1.5);
+scatter(user_pos(:,1), user_pos(:,2), 50, 'b', 'filled');
+th = linspace(0, 2*pi, 100);
+plot(user_X_center + user_R*cos(th), user_Y_center + user_R*sin(th), '--', 'Color', [0.6 0.6 0.6]);
+
+plot(x_traj, y_traj, '--k', 'LineWidth', 1.5);  % 初始轨迹 (直线)
+plot(x_opt, y_opt, '-r', 'LineWidth', 2, 'Marker', '.');
+% 时隙标注（每隔 5 个时隙，与 main_1000 一致）
+step_mark = 5;
+for n = 1:step_mark:Nslot
+    y_offset = 500;
+    text(x_opt(n), y_opt(n) + y_offset, sprintf('t=%d', n), 'FontSize', 9, 'Color', [0.5 0 0.5], 'FontWeight', 'bold');
+    plot(x_opt(n), y_opt(n), 'o', 'MarkerSize', 5, 'MarkerEdgeColor', [0.5 0 0.5]);
+end
+if mod(Nslot-1, step_mark) ~= 0
+    text(x_opt(end), y_opt(end) + 500, sprintf('t=%d', Nslot), 'FontSize', 9, 'Color', [0.5 0 0.5], 'FontWeight', 'bold');
+end
+
+plot(x_start, y_start, 'go', 'MarkerSize', 8, 'MarkerFaceColor', 'g');
+plot(x_end, y_end, 'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+
+legend({'BS', 'Users', 'User Region', '初始轨迹 (直线)', '优化后轨迹'}, 'Location', 'best');
+xlabel('x (m)'); ylabel('y (m)');
+title('USV轨迹图 (45km 场景算法驱动力测试)', 'FontSize', 13, 'FontWeight', 'bold');
+xlim([-1000, 46000]); 
+ylim([-9000, 2000]); 
+yline(0, 'k-', 'y=0 边界', 'LineWidth', 1.5); 
+
+% 子图2：WSR（与 main_1000 一致，标出峰值）
+subplot(1, 2, 2); hold on; grid on; box on;
+plot(1:Nslot, wsr_final, '-r', 'LineWidth', 2.0, 'Marker', 'o', 'MarkerSize', 4, 'MarkerFaceColor', 'r');
+plot(best_slot, wsr_max, 'kp', 'MarkerSize', 12, 'MarkerFaceColor', 'y');
+text(best_slot, wsr_max + 0.3, sprintf('Max: %.2f', wsr_max), 'HorizontalAlignment', 'center');
+xlabel('时隙数'); ylabel('WSR (bps/Hz)');
+title(sprintf('加权和速率变化 (平均 WSR: %.4f)', mean(wsr_final)), 'FontSize', 13, 'FontWeight', 'bold');
+
+fprintf('\n45km 场景：轨迹应向 y=0 (用户侧) 弯曲，WSR 在靠近用户处达到峰值。\n');

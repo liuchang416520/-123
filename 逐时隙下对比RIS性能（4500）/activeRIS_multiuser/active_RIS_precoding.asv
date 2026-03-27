@@ -1,0 +1,350 @@
+function [W,Theta,Rsum,Rho_k,eps_k,varargout] = active_RIS_precoding( ...
+    M,K,N,Ps_max,Pr_max,sigma2,sigmar2,eta_k,Theta,W,h_k,f_k,G,varargin)
+
+% 说明：
+% 1) 当传入 traj_cfg.enable=true 时，执行“逐时隙轨迹+通信”联合优化。
+% 2) 否则执行原有 FP 通信变量优化（固定位置）。
+% 3) B组新增：支持每个slot固定一个随机seed，同slot内保持一致，不同slot不同。
+
+iteration = 30;
+traj_mode = false;
+traj_cfg = struct();
+
+if ~isempty(varargin)
+    traj_cfg = varargin{1};
+    if isstruct(traj_cfg) && isfield(traj_cfg,'enable') && traj_cfg.enable
+        traj_mode = true;
+    end
+end
+
+% 日志级别：
+% 0 = 安静，仅输出时隙级结果
+% 1 = 输出异常/摘要
+% 2 = 输出完整 FP 调试信息
+log_level = 0;
+if isfield(traj_cfg,'log_level') && ~isempty(traj_cfg.log_level)
+    log_level = traj_cfg.log_level;
+end
+
+if traj_mode
+    % ==========================================================
+    % 模式一：逐时隙贪心轨迹优化（Slot-by-slot BCD）
+    % ==========================================================
+
+    % 默认参数
+    if ~isfield(traj_cfg,'Nslot'), traj_cfg.Nslot = numel(traj_cfg.x_traj); end
+    if ~isfield(traj_cfg,'MaxIter'), traj_cfg.MaxIter = 12; end
+    if ~isfield(traj_cfg,'y_min'), traj_cfg.y_min = -inf; end
+    if ~isfield(traj_cfg,'y_max'), traj_cfg.y_max = inf; end
+    if ~isfield(traj_cfg,'x_coast_min'), traj_cfg.x_coast_min = []; end
+    if ~isfield(traj_cfg,'no_direct_link'), traj_cfg.no_direct_link = false; end
+    if ~isfield(traj_cfg,'enable_early_hover_stop'), traj_cfg.enable_early_hover_stop = false; end
+
+    % ===== B组新增 =====
+    if ~isfield(traj_cfg,'use_slot_seed'), traj_cfg.use_slot_seed = false; end
+    if ~isfield(traj_cfg,'slot_seed_base'), traj_cfg.slot_seed_base = 1000; end
+
+    scale_G = 1e3;
+    scale_f = 1e6;
+    if isfield(traj_cfg,'scale_G'), scale_G = traj_cfg.scale_G; end
+    if isfield(traj_cfg,'scale_f'), scale_f = traj_cfg.scale_f; end
+
+    Pr_max_eff   = Pr_max   * (scale_G^2);
+    sigmar2_eff  = sigmar2  * (scale_G^2);
+    sigma2_eff   = sigma2   * (scale_G^2 * scale_f^2);
+
+    x_opt = traj_cfg.x_traj;
+    y_opt = traj_cfg.y_traj;
+    sum_rate_slot = zeros(traj_cfg.Nslot, 1);
+    W_slots = cell(traj_cfg.Nslot, 1);
+    Theta_slots = cell(traj_cfg.Nslot, 1);
+
+    % =========================
+    % 初始化第1时隙：只做通信优化
+    % =========================
+    if traj_cfg.use_slot_seed
+        slot_seed_init = traj_cfg.slot_seed_base + 1;
+        [ch_init, ~, ~] = build_slot_channels( ...
+            K, N, M, traj_cfg.bs_pos, traj_cfg.user_pos, ...
+            x_opt(1), y_opt(1), traj_cfg.h_const, traj_cfg.lambda, ...
+            traj_cfg.gamma_reflect, traj_cfg.K_rician, traj_cfg.no_direct_link, ...
+            scale_G, scale_f, slot_seed_init);
+    else
+        [ch_init, ~, ~] = build_slot_channels( ...
+            K, N, M, traj_cfg.bs_pos, traj_cfg.user_pos, ...
+            x_opt(1), y_opt(1), traj_cfg.h_const, traj_cfg.lambda, ...
+            traj_cfg.gamma_reflect, traj_cfg.K_rician, traj_cfg.no_direct_link, ...
+            scale_G, scale_f);
+    end
+
+    ch_init(1).h_k = 0.1 * ch_init(1).h_k;
+
+    [comm_1, ~, ~, ~, sr_1] = optimize_comm_fp( ...
+        K, M, N, Ps_max, sigma2_eff, sigmar2_eff, ...
+        eta_k, ch_init(1), true, Pr_max_eff, struct(), traj_cfg);
+
+    sum_rate_slot(1) = sr_1;
+    W_slots{1} = comm_1.W;
+    Theta_slots{1} = comm_1.Theta;
+    prev_comm = comm_1;
+
+    fprintf('初始时隙 t=1: pos=(%.1f, %.1f), WSR=%.4f\n', x_opt(1), y_opt(1), sr_1);
+
+    % =========================
+    % 外层逐时隙推进
+    % =========================
+    for n = 2:traj_cfg.Nslot
+        x_prev = x_opt(n-1);
+        y_prev = y_opt(n-1);
+
+        % 当前时隙的局部展开点
+        x_local = x_prev;
+        y_local = y_prev;
+
+        % ===== B组关键：每个slot固定一个seed =====
+        if traj_cfg.use_slot_seed
+            slot_seed_n = traj_cfg.slot_seed_base + n;
+        else
+            slot_seed_n = [];
+        end
+
+        xy_hist = nan(traj_cfg.MaxIter, 2);
+
+        for it = 1:traj_cfg.MaxIter
+            % 1) 在当前位置构建单时隙信道
+            if traj_cfg.use_slot_seed
+                [ch_local, x_BR_0, x_RU_0] = build_slot_channels( ...
+                    K, N, M, traj_cfg.bs_pos, traj_cfg.user_pos, ...
+                    x_local, y_local, traj_cfg.h_const, traj_cfg.lambda, ...
+                    traj_cfg.gamma_reflect, traj_cfg.K_rician, ...
+                    traj_cfg.no_direct_link, scale_G, scale_f, slot_seed_n);
+            else
+                [ch_local, x_BR_0, x_RU_0] = build_slot_channels( ...
+                    K, N, M, traj_cfg.bs_pos, traj_cfg.user_pos, ...
+                    x_local, y_local, traj_cfg.h_const, traj_cfg.lambda, ...
+                    traj_cfg.gamma_reflect, traj_cfg.K_rician, ...
+                    traj_cfg.no_direct_link, scale_G, scale_f);
+            end
+
+            ch_local(1).h_k = 0.1 * ch_local(1).h_k;
+            x_BR_0 = max(x_BR_0, 1e-3);
+            x_RU_0 = max(x_RU_0, 1e-3);
+
+            % 2) 优化该时隙通信变量并提取 E 系数
+            [comm_n, E1_n, E2_n, E3_n, sr_local] = optimize_comm_fp( ...
+                K, M, N, Ps_max, sigma2_eff, sigmar2_eff, ...
+                eta_k, ch_local(1), true, Pr_max_eff, prev_comm, traj_cfg);
+            prev_comm = comm_n;
+
+            % 3) 轨迹 SCA 单步更新
+            [x_new, y_new] = trajectory_update_sca( ...
+                x_prev, y_prev, x_local, y_local, ...
+                x_BR_0, x_RU_0, traj_cfg.user_pos, traj_cfg.bs_pos, ...
+                traj_cfg.dt, traj_cfg.v_max, traj_cfg.y_min, traj_cfg.y_max, ...
+                E1_n, E2_n, E3_n, ...
+                traj_cfg.tau_power, traj_cfg.kappa_power, traj_cfg.h_const, ...
+                Ps_max, Pr_max, traj_cfg.lambda, traj_cfg.x_coast_min);
+
+            xy_hist(it,:) = [x_new, y_new];
+
+            two_cycle = false;
+            if it >= 3
+                if norm([x_new - xy_hist(it-2,1); y_new - xy_hist(it-2,2)]) < 1e-3
+                    two_cycle = true;
+                end
+            end
+
+            if two_cycle
+                % 直接取 x 更大的那个点，避免来回震荡
+                if x_new >= x_local
+                    x_local = x_new;
+                    y_local = y_new;
+                end
+                break;
+            end
+
+            move_norm = norm([x_new - x_local; y_new - y_local]);
+
+            if move_norm < 1e-3
+                x_local = x_new;
+                y_local = y_new;
+                break;
+            end
+
+            if isfield(traj_cfg,'log_level') && traj_cfg.log_level >= 1
+                fprintf('  [traj] slot=%d it=%d move=%.4e -> (%.2f, %.2f)\n', ...
+                    n, it, move_norm, x_new, y_new);
+            end
+
+            x_local = x_new;
+            y_local = y_new;
+        end
+
+        x_opt(n) = x_local;
+        y_opt(n) = y_local;
+        sum_rate_slot(n) = sr_local;
+        W_slots{n} = comm_n.W;
+        Theta_slots{n} = comm_n.Theta;
+
+        fprintf('时隙 t=%d: pos=(%.1f, %.1f), WSR=%.4f\n', ...
+            n, x_opt(n), y_opt(n), sr_local);
+
+        if traj_cfg.enable_early_hover_stop && ...
+                norm([x_opt(n) - x_prev; y_opt(n) - y_prev]) < 1e-2
+            fprintf('>>> 在时隙 %d 达到稳定悬停点，提前填充后续时隙\n', n);
+            x_opt(n+1:end) = x_opt(n);
+            y_opt(n+1:end) = y_opt(n);
+            sum_rate_slot(n+1:end) = sr_local;
+            for rem = (n+1):traj_cfg.Nslot
+                W_slots{rem} = comm_n.W;
+                Theta_slots{rem} = comm_n.Theta;
+            end
+            break;
+        end
+    end
+
+    W = W_slots{end};
+    Theta = Theta_slots{end};
+    Rsum = sum_rate_slot(end);
+    Rho_k = [];
+    eps_k = [];
+
+    if nargout > 5
+        varargout{1} = x_opt;
+        varargout{2} = y_opt;
+        varargout{3} = sum_rate_slot;
+        if nargout > 8
+            varargout{4} = struct();
+        end
+    end
+    return;
+end
+
+% ==========================================================
+% 模式二：固定位置下的 FP 通信优化
+% ==========================================================
+Rho_k = ones(K,1);
+eps_k = ones(K,1);
+Rsum = 0;
+Rsum_history = -inf(2*iteration,1);
+
+% theta 更新阻尼
+alpha_theta = 0.02;
+
+% 异常计数
+theta_fail_count = 0;
+theta_collapse_count = 0;
+
+for Q = 1:iteration
+    % ---------- 预检查 ----------
+    w_k = w_k_generate(K,M,W);
+    [~, gamma_k] = SINR_calculate(K,M,N,eta_k,h_k,f_k,G,Theta,w_k,sigma2,sigmar2);
+
+    if log_level >= 2
+        fprintf('  [FP-pre] Q=%d, maxGamma=%.4e, minGamma=%.4e, ||W||=%.4e, ||theta||=%.4e\n', ...
+            Q, max(gamma_k), min(gamma_k), norm(W), norm(Theta*ones(N,1)));
+    end
+
+    Rho_k = gamma_k;
+    eps_k = eps_update(K,M,N,Rho_k,eta_k,h_k,f_k,G,Theta,w_k,sigma2,sigmar2);
+    [V, A] = v_A_k_generate(K,M,N,Rho_k,eta_k,eps_k,h_k,f_k,G,Theta);
+
+    if log_level >= 2
+        fprintf('  [FP-mid] Q=%d, ||Rho||=%.4e, ||eps||=%.4e, ||V||=%.4e, ||A||_F=%.4e\n', ...
+            Q, norm(Rho_k), norm(eps_k), norm(V), norm(A,'fro'));
+    end
+
+    % ---------- W 子问题 ----------
+    theta_vec_dbg = Theta * ones(N,1);
+    P_ris_max_dbg = Pr_max - real(theta_vec_dbg' * theta_vec_dbg) * sigmar2;
+
+    if log_level >= 2
+        fprintf('  [W-sub] Q=%d, P_ris_max=%.4e\n', Q, P_ris_max_dbg);
+    end
+
+    W = w_k2W(K,M,w_k);
+    W = cvx_solve_W(M,K,G,Theta,V,A,W,Ps_max,Pr_max,sigmar2);
+
+    if log_level >= 2
+        fprintf('  [W-out] Q=%d, ||W||=%.4e, Pbs=%.4e\n', Q, norm(W), real(W' * W));
+    end
+
+    w_k = w_k_generate(K,M,W);
+    [Rsum_temp, ~] = SINR_calculate(K,M,N,eta_k,h_k,f_k,G,Theta,w_k,sigma2,sigmar2);
+    Rsum_history(2*Q-1) = Rsum_temp;
+
+    % ---------- theta 子问题 ----------
+    eps_k = eps_update(K,M,N,Rho_k,eta_k,h_k,f_k,G,Theta,w_k,sigma2,sigmar2);
+    [nu, Lam] = nu_Lam_generate(K,M,N,Rho_k,eta_k,eps_k,h_k,f_k,G,w_k,sigmar2);
+
+    if log_level >= 2
+        fprintf('  [Theta-sub] Q=%d, ||nu||=%.4e, ||Lam||_F=%.4e\n', Q, norm(nu), norm(Lam,'fro'));
+    end
+
+    theta_old = Theta * ones(N,1);
+    theta_cvx = cvx_solve_theta(N,K,M,theta_old,nu,Lam,w_k,G,Pr_max,sigmar2);
+
+    % 崩塌保护
+    collapse_flag = false;
+    if norm(theta_cvx) < 0.1 * max(norm(theta_old), 1e-12)
+        theta_cvx = theta_old;
+        collapse_flag = true;
+        theta_collapse_count = theta_collapse_count + 1;
+    end
+
+    % 阻尼更新
+    theta = (1 - alpha_theta) * theta_old + alpha_theta * theta_cvx;
+    Theta = diag(theta);
+
+    if log_level >= 2
+        fprintf('  [Theta-out] Q=%d, ||theta||=%.4e\n', Q, norm(theta));
+    end
+
+    if log_level >= 1
+        % 只在异常时打印
+        if collapse_flag
+            fprintf('  [warn] Q=%d: theta update collapsed, fallback to theta_old\n', Q);
+        end
+        if ~all(isfinite(theta))
+            fprintf('  [warn] Q=%d: theta contains NaN/Inf\n', Q);
+        end
+        if P_ris_max_dbg <= 0
+            fprintf('  [warn] Q=%d: P_ris_max <= 0 (%.4e)\n', Q, P_ris_max_dbg);
+        end
+    end
+
+    % 重新用最终 W/Theta 计算本轮真实速率
+    w_k = w_k_generate(K,M,W);
+    [Rsum_temp, ~] = SINR_calculate(K,M,N,eta_k,h_k,f_k,G,Theta,w_k,sigma2,sigmar2);
+    Rsum_history(2*Q) = Rsum_temp;
+
+    if log_level >= 1
+        % 只打印少量摘要：首轮、末轮、以及每 5 轮一次
+        if Q == 1 || Q == iteration || mod(Q,5) == 0
+            fprintf('  [FP] Q=%d, Rsum=%.4f, ||W||=%.3e, ||theta||=%.3e\n', ...
+                Q, Rsum_temp, norm(W), norm(theta));
+        end
+    end
+
+    if Q > 1
+        denom = max(abs(Rsum_history(2*Q-2)), 1e-12);
+        diff = (Rsum_history(2*Q) - Rsum_history(2*Q-2)) / denom;
+        if abs(diff) < 1e-4
+            if log_level >= 1
+                fprintf('  [FP] converged at Q=%d, diff=%.3e\n', Q, diff);
+            end
+            break;
+        end
+    end
+end
+
+% 返回与最终 W/Theta 一致的真实速率
+w_k_final = w_k_generate(K,M,W);
+[Rsum, ~] = SINR_calculate(K,M,N,eta_k,h_k,f_k,G,Theta,w_k_final,sigma2,sigmar2);
+
+if log_level >= 1
+    fprintf('  [FP-summary] Rsum=%.4f, ||W||=%.3e, ||theta||=%.3e, collapse=%d\n', ...
+        Rsum, norm(W), norm(Theta*ones(N,1)), theta_collapse_count);
+end
+
+end

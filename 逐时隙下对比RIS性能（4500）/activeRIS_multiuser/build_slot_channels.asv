@@ -1,0 +1,96 @@
+function [channels, x_BR_0, x_RU_0] = build_slot_channels( ...
+    K, N_RIS, M, bs_pos, user_pos, x_traj, y_traj, h_const, ...
+    lambda, gamma_reflect, K_rician, no_direct_link, varargin)
+% 为每个时隙构建信道 (BS-RIS, RIS-UE, BS-UE)
+%
+% 可选参数：
+%   varargin{1} = scale_G
+%   varargin{2} = scale_f
+%   varargin{3} = slot_seed
+%
+% 设计目的：
+% 1) 不再在函数内部写死 rng(999)
+% 2) 允许“每个slot一个固定seed”
+% 3) 同一slot内部多次调用时，如果seed相同，则小尺度衰落保持一致
+% 4) 不同slot使用不同seed时，得到真实的slot间起伏
+
+Nslot = numel(x_traj);
+
+channels = repmat(struct( ...
+    'h_k', [], 'f_k', [], 'G', [], ...
+    'h_k_bar', [], 'f_k_bar', [], 'G_bar', []), Nslot, 1);
+
+% 默认缩放
+scale_G = 1e3;
+scale_f = 1e6;
+slot_seed = [];
+
+if ~isempty(varargin) && numel(varargin) >= 1 && ~isempty(varargin{1})
+    scale_G = varargin{1};
+end
+if ~isempty(varargin) && numel(varargin) >= 2 && ~isempty(varargin{2})
+    scale_f = varargin{2};
+end
+if ~isempty(varargin) && numel(varargin) >= 3 && ~isempty(varargin{3})
+    slot_seed = varargin{3};
+end
+
+% ===== B组关键：只在外部明确给seed时才重置 =====
+if ~isempty(slot_seed)
+    rng(slot_seed);
+end
+
+x_BR_0 = zeros(Nslot, 1);
+x_RU_0 = zeros(K, Nslot);
+
+for n = 1:Nslot
+    ris_pos = [x_traj(n), y_traj(n), h_const];
+
+    d_BR = max(distance(bs_pos, ris_pos), 1.0);
+    x_BR_0(n) = d_BR;
+
+    d_RU = zeros(K,1);
+    for k = 1:K
+        d_RU(k) = max(distance(ris_pos, user_pos(k,:)), 1.0);
+        x_RU_0(k,n) = d_RU(k);
+    end
+
+    d_BU = zeros(K,1);
+    for k = 1:K
+        d_BU(k) = max(distance(bs_pos, user_pos(k,:)), 1.0);
+    end
+
+    [h_k, f_k, G, h_k_bar, f_k_bar, G_bar] = Channel_generate2( ...
+        K, N_RIS, M, d_BR, d_BU, d_RU, ...
+        bs_pos(3), h_const, user_pos(1,3), ...
+        lambda, gamma_reflect, K_rician);
+
+    % 直射链路控制
+    direct_link_attenuation = 1;
+    if no_direct_link
+        h_k = zeros(size(h_k));
+        h_k_bar = zeros(size(h_k_bar));
+    else
+        h_k = h_k * direct_link_attenuation;
+        h_k_bar = h_k_bar * direct_link_attenuation;
+    end
+
+    % 信道分离缩放
+    G_scaled = G * scale_G;
+    f_k_scaled = f_k * scale_f;
+    h_k_scaled = h_k * (scale_G * scale_f);
+
+    G_bar_scaled = G_bar * scale_G;
+    f_k_bar_scaled = f_k_bar * scale_f;
+    h_k_bar_scaled = h_k_bar * (scale_G * scale_f);
+
+    channels(n).h_k = h_k_scaled;
+    channels(n).f_k = f_k_scaled;
+    channels(n).G   = G_scaled;
+
+    channels(n).h_k_bar = h_k_bar_scaled;
+    channels(n).f_k_bar = f_k_bar_scaled;
+    channels(n).G_bar   = G_bar_scaled;
+end
+
+end
